@@ -1,0 +1,260 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+// ===== LCD1 (Gate) - address 0x27 =====
+LiquidCrystal_I2C lcd1(0x26, 16, 2);
+
+// ===== LCD2 (Parking slots) - address 0x26 (change if different) =====
+LiquidCrystal_I2C lcd2(0x27, 16, 2);
+
+// ===== SERVOS =====
+Servo servoEntry;
+Servo servoExit;
+
+// ===== RFID ENTRY =====
+#define SS_ENTRY 10
+#define RST_ENTRY 7
+MFRC522 rfidEntry(SS_ENTRY, RST_ENTRY);
+
+// ===== RFID EXIT =====
+#define SS_EXIT 9
+#define RST_EXIT 8
+MFRC522 rfidExit(SS_EXIT, RST_EXIT);
+
+// ===== IR SENSORS (gates) =====
+#define ENTER_IR 34
+#define EXIT_IR  36
+
+// ===== PARKING SLOT SENSORS =====
+const int sensorPins[6] = {22, 24, 26, 28, 30, 32};
+
+// ===== SYSTEM =====
+#define MAX_CARS 10
+String uidList[MAX_CARS];
+unsigned long timeList[MAX_CARS];
+
+// ===== PRICING =====
+const int RATE_PER_SECOND = 200; // 200 EGP per second (demo)
+
+// ===== GATE ANGLES =====
+const int ENTRY_CLOSED = 90;
+const int ENTRY_OPEN   = 180;
+const int EXIT_CLOSED  = 180;
+const int EXIT_OPEN    = 90;
+
+// ===== GATE STATES =====
+bool entryGateOpen = false;
+bool exitGateOpen  = false;
+
+// ===== CUSTOM NUMBER CHARACTERS FOR LCD2 =====
+byte rot1[8] = {B00000,B00000,B10010,B11111,B10000,B00000,B00000,B00000};
+byte rot2[8] = {B00000,B00000,B11101,B10101,B10101,B10111,B00000,B00000};
+byte rot3[8] = {B00000,B00000,B10001,B10101,B10101,B11111,B00000,B00000};
+byte rot4[8] = {B00000,B00000,B00111,B00100,B00100,B11111,B00000,B00000};
+byte rot5[8] = {B00000,B00000,B10111,B10101,B10101,B11101,B00000,B00000};
+byte rot6[8] = {B00000,B00000,B11111,B10101,B10101,B11101,B00000,B00000};
+
+// ===== READ UID =====
+String readUID(MFRC522 &rfid) {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  return uid;
+}
+
+// ===== FIND CAR =====
+int findCar(String uid) {
+  for (int i = 0; i < MAX_CARS; i++) {
+    if (uidList[i] == uid) return i;
+  }
+  return -1;
+}
+
+// ===== ADD CAR =====
+void addCar(String uid) {
+  for (int i = 0; i < MAX_CARS; i++) {
+    if (uidList[i] == "") {
+      uidList[i] = uid;
+      timeList[i] = millis();
+      return;
+    }
+  }
+}
+
+// ===== REMOVE CAR =====
+void removeCar(int index) {
+  uidList[index] = "";
+  timeList[index] = 0;
+}
+
+void setup() {
+  Serial.begin(9600);
+  SPI.begin();
+  rfidEntry.PCD_Init();
+  rfidExit.PCD_Init();
+
+  // ===== LCD1 (Gate) =====
+  lcd1.init();
+  lcd1.backlight();
+
+  // ===== LCD2 (Parking slots) =====
+  lcd2.init();
+  lcd2.backlight();
+  lcd2.clear();
+  lcd2.createChar(0, rot1);
+  lcd2.createChar(1, rot2);
+  lcd2.createChar(2, rot3);
+  lcd2.createChar(3, rot4);
+  lcd2.createChar(4, rot5);
+  lcd2.createChar(5, rot6);
+
+  // ===== SERVOS =====
+  servoEntry.attach(3);
+  servoExit.attach(2);
+  servoEntry.write(ENTRY_CLOSED);
+  servoExit.write(EXIT_CLOSED);
+
+  // ===== IR SENSORS (gate) =====
+  pinMode(ENTER_IR, INPUT_PULLUP);
+  pinMode(EXIT_IR, INPUT_PULLUP);
+
+  // ===== PARKING SLOT SENSORS =====
+  for (int i = 0; i < 6; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+
+  lcd1.setCursor(0,0);
+  lcd1.print("Smart Parking");
+  lcd1.setCursor(0,1);
+  lcd1.print("System Ready");
+  Serial.println("SYSTEM READY");
+  delay(2000);
+  lcd1.clear();
+}
+
+void loop() {
+  handleGateLogic();
+  handleParkingDisplay();
+}
+
+// ================= GATE LOGIC (LCD1) =================
+void handleGateLogic() {
+
+  // ---- ENTRY RFID ----
+  if (!entryGateOpen && rfidEntry.PICC_IsNewCardPresent() &&
+      rfidEntry.PICC_ReadCardSerial()) {
+    String uid = readUID(rfidEntry);
+    Serial.println("\nENTRY");
+    Serial.println(uid);
+
+    int existing = findCar(uid);
+
+    if (existing != -1) {
+      lcd1.clear();
+      lcd1.setCursor(0,0);
+      lcd1.print("Already Parked");
+      Serial.println("CARD ALREADY INSIDE - ENTRY DENIED");
+      delay(1500);
+      lcd1.clear();
+    } else {
+      addCar(uid);
+
+      servoEntry.write(ENTRY_OPEN);
+      entryGateOpen = true;
+
+      lcd1.clear();
+      lcd1.setCursor(0,0);
+      lcd1.print("Entry OK");
+      lcd1.setCursor(0,1);
+      lcd1.print("Welcome");
+    }
+
+    rfidEntry.PICC_HaltA();
+    rfidEntry.PCD_StopCrypto1();
+  }
+
+  // ---- ENTRY GATE CLOSE (IR) ----
+  if (entryGateOpen && digitalRead(ENTER_IR) == LOW) {
+    servoEntry.write(ENTRY_CLOSED);
+    entryGateOpen = false;
+    lcd1.clear();
+  }
+
+  // ---- EXIT RFID ----
+  if (!exitGateOpen && rfidExit.PICC_IsNewCardPresent() &&
+      rfidExit.PICC_ReadCardSerial()) {
+    String uid = readUID(rfidExit);
+    Serial.println("\nEXIT");
+    Serial.println(uid);
+    int index = findCar(uid);
+
+    lcd1.clear();
+    if (index != -1) {
+      unsigned long seconds = (millis() - timeList[index]) / 1000;
+      int fee = seconds * RATE_PER_SECOND;
+
+      Serial.print("Time: ");
+      Serial.println(seconds);
+      Serial.print("Fee: ");
+      Serial.println(fee);
+
+      servoExit.write(EXIT_OPEN);
+      exitGateOpen = true;
+
+      lcd1.setCursor(0,0);
+      lcd1.print("T:");
+      lcd1.print(seconds);
+      lcd1.print("s");
+      lcd1.setCursor(0,1);
+      lcd1.print("F:");
+      lcd1.print(fee);
+      lcd1.print("EGP");
+
+      removeCar(index);
+    } else {
+      lcd1.setCursor(0,0);
+      lcd1.print("Not Found");
+      lcd1.setCursor(0,1);
+      lcd1.print("No Entry Record");
+      Serial.println("CARD NOT FOUND - EXIT DENIED");
+      delay(1500);
+      lcd1.clear();
+    }
+
+    rfidExit.PICC_HaltA();
+    rfidExit.PCD_StopCrypto1();
+  }
+
+  // ---- EXIT GATE CLOSE (IR) ----
+  if (exitGateOpen && digitalRead(EXIT_IR) == LOW) {
+    servoExit.write(EXIT_CLOSED);
+    exitGateOpen = false;
+    lcd1.clear();
+  }
+}
+
+// ================= PARKING SLOT DISPLAY (LCD2) =================
+void handleParkingDisplay() {
+  bool slotEmpty[6];
+  for (int i = 0; i < 6; i++) {
+    slotEmpty[i] = (digitalRead(sensorPins[i]) == HIGH);
+  }
+
+  lcd2.setCursor(15, 0);
+  if (slotEmpty[2]) lcd2.write(2); else lcd2.print(" ");
+  lcd2.setCursor(14, 0);
+  if (slotEmpty[1]) lcd2.write(1); else lcd2.print(" ");
+  lcd2.setCursor(13, 0);
+  if (slotEmpty[0]) lcd2.write(0); else lcd2.print(" ");
+
+  lcd2.setCursor(15, 1);
+  if (slotEmpty[3]) lcd2.write(3); else lcd2.print(" ");
+  lcd2.setCursor(14, 1);
+  if (slotEmpty[4]) lcd2.write(4); else lcd2.print(" ");
+  lcd2.setCursor(13, 1);
+  if (slotEmpty[5]) lcd2.write(5); else lcd2.print(" ");
+}
